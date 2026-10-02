@@ -1,12 +1,18 @@
 import os
+import sys
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from pymongo import MongoClient, GEOSPHERE
+try:
+    from supabase import Client, create_client  # type: ignore[reportMissingImports]
+except ImportError as exc:
+    print("[FATAL] The 'supabase' package is not installed for this Python.")
+    print(f"[FATAL] Run:  {sys.executable} -m pip install supabase python-dotenv")
+    raise SystemExit(1) from exc
 import cv2
 import numpy as np
 import time
@@ -19,19 +25,25 @@ from PIL import Image
 from collections import deque
 from datetime import datetime
 from ultralytics import YOLO
-from typing import Optional
+from typing import Optional, Literal
 
 app = FastAPI(title="Jan Suraksha Core API")
 
+# Comma-separated list of allowed frontend origins, e.g.
+# ALLOWED_ORIGINS=https://mini-project-eight-sepia.vercel.app
+# Defaults to "*" (any origin) if unset. The frontend sends no cookies, so credentials stay off.
+_origins_env = os.environ.get("ALLOWED_ORIGINS", "*").strip()
+ALLOWED_ORIGINS = ["*"] if _origins_env in ("", "*") else [o.strip().rstrip("/") for o in _origins_env.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------- DATABASE SETUP & GEO-INDEXING -----------------
+# ----------------- DATABASE SETUP (SUPABASE) -----------------
 import hashlib
 import secrets
 import sys
@@ -51,17 +63,54 @@ def verify_auth_key(raw_key: str, stored: str) -> bool:
     salt, _ = stored.split("$", 1)
     return secrets.compare_digest(hash_auth_key(raw_key, salt), stored)
 
-try:
-    client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=5000)
-    client.admin.command("ping")
-except Exception as e:
-    print(f"[FATAL] Could not connect to MongoDB at mongodb://localhost:27017/ - {e}")
-    print("[FATAL] Is MongoDB running? Jan Suraksha cannot start without it.")
+# Load simple KEY=VALUE entries from .env without requiring python-dotenv.
+env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.isfile(env_file):
+    with open(env_file, encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key, value = key.strip(), value.strip()
+            if value[:1] == value[-1:] and value[:1] in {"'", '"'}:
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+# Service-role key: backend only. It bypasses Row Level Security, so it must
+# never appear in any .html file or be committed to git.
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("[FATAL] Set SUPABASE_URL and SUPABASE_SERVICE_KEY (env vars or a .env file).")
     sys.exit(1)
 
-db = client["jan_suraksha"]
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    supabase.table("admins").select("id").limit(1).execute()
+except Exception as e:
+    print(f"[FATAL] Could not connect to Supabase - {e}")
+    print("[FATAL] Check SUPABASE_URL / SUPABASE_SERVICE_KEY and that the tables exist.")
+    sys.exit(1)
 
-EVIDENCE_DIR = os.path.join(os.path.dirname(__file__), "evidence")
+def haversine_m(lat1, lng1, lat2, lng2):
+    """Great-circle distance in metres (replaces Mongo's $nearSphere)."""
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+def _count(table, statuses, exclude=False):
+    q = supabase.table(table).select("id", count="exact", head=True)
+    q = q.not_.in_("status", statuses) if exclude else q.in_("status", statuses)
+    return q.execute().count or 0
+
+# Public URL of this backend, used to build evidence links. Render sets RENDER_EXTERNAL_URL automatically.
+PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://jan-suraksha.onrender.com").rstrip("/")
+
+EVIDENCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence")
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
 app.mount("/evidence", StaticFiles(directory=EVIDENCE_DIR), name="evidence")
 
@@ -70,39 +119,41 @@ def generate_id():
 
 def init_db():
     try:
-        if db.admins.count_documents({}) == 0:
-            db.admins.insert_one({
-                "_id": generate_id(), 
-                "operator_id": "JS-OP-9014", 
+        if _table_empty("admins"):
+            supabase.table("admins").insert({
+                "id": generate_id(),
+                "operator_id": "JS-OP-9014",
                 "auth_key": hash_auth_key("admin123")
-            })
+            }).execute()
             print("[SYSTEM] Default admin created (JS-OP-9014 / admin123) - change this credential.")
-        if db.responders.count_documents({}) == 0:
-            db.responders.insert_many([
-                {"_id": generate_id(), "operator_id": "JS-POL-001", "auth_key": hash_auth_key("police123"), "department": "POLICE"},
-                {"_id": generate_id(), "operator_id": "JS-EMS-002", "auth_key": hash_auth_key("ems123"), "department": "EMS"},
-                {"_id": generate_id(), "operator_id": "JS-CIV-003", "auth_key": hash_auth_key("civic123"), "department": "CIVIC"}
-            ])
+        if _table_empty("responders"):
+            base = generate_id()
+            supabase.table("responders").insert([
+                {"id": base,     "operator_id": "JS-POL-001", "auth_key": hash_auth_key("police123"), "department": "POLICE"},
+                {"id": base + 1, "operator_id": "JS-EMS-002", "auth_key": hash_auth_key("ems123"), "department": "EMS"},
+                {"id": base + 2, "operator_id": "JS-CIV-003", "auth_key": hash_auth_key("civic123"), "department": "CIVIC"}
+            ]).execute()
             print("[SYSTEM] Default responders created - change these credentials.")
-
-        db.reports.create_index([("loc", GEOSPHERE)])
-        print("[SYSTEM] Database Initialized. Geo-Indexes Active.")
+        print("[SYSTEM] Supabase connected and initialized.")
     except Exception as e:
         print(f"[FATAL] Database initialization failed: {e}")
         sys.exit(1)
 
+def _table_empty(table):
+    return (supabase.table(table).select("id", count="exact", head=True).execute().count or 0) == 0
+
 init_db()
 
 def format_doc(doc):
-    if doc:
-        doc["id"] = doc.pop("_id")
+    # Supabase rows already carry "id"; kept so callers don't change.
     return doc
 
 # ----------------- HARDWARE TELEMETRY CACHE -----------------
 hardware_state = {
-    "water_level_cm": 0.0, "prev_water_level_cm": 0.0, 
-    "rain_detected": False, "water_contact": False, 
-    "pump_active": False, "system_status": "NORMAL", "last_update": 0
+    "water_raw": 0,
+    "rain_raw": 0,
+    "overall_state": "NORMAL",
+    "last_update": 0
 }
 
 CCTV_NODES = [
@@ -126,11 +177,11 @@ def get_suppressed_stats():
 
 # ----------------- DATA MODELS -----------------
 class ESP32Telemetry(BaseModel):
-    water_level_cm: float
-    rain_detected: bool
-    water_contact: bool
-    pump_active: bool
-    system_status: str
+    # Data continuously sent by the ESP32 environmental module.
+    # Ultrasonic distance is intentionally local-only and is not received here.
+    water_raw: int
+    rain_raw: int
+    overall_state: Literal["NORMAL", "WARNING", "CRITICAL"]
 
 class StatusUpdate(BaseModel):
     status: str
@@ -194,41 +245,68 @@ def verify_semantic_relevance(frame: np.ndarray, category: str) -> tuple[bool, s
 
 def find_nearby_duplicate(lat: float, lng: float, concern_type: str, max_meters: float = 50.0):
     if not lat or not lng: return None
-    return db.reports.find_one({
-        "status": {"$in": ["Pending", "Pending Review", "🚓 DISPATCHED (POLICE)", "🚑 DISPATCHED (EMS)", "🚜 DISPATCHED (CIVIC)"]},
-        "concern_type": concern_type,
-        "loc": {"$nearSphere": {"$geometry": {"type": "Point", "coordinates": [lng, lat]}, "$maxDistance": max_meters}}
-    })
+    rows = (supabase.table("reports")
+            .select("id,lat,lng,status,citizen_upvotes,supplementary_evidence")
+            .eq("concern_type", concern_type)
+            .not_.is_("lat", "null").not_.is_("lng", "null")
+            .order("id", desc=True).limit(500).execute().data) or []
+    best, best_d = None, max_meters
+    for r in rows:
+        st = r.get("status") or ""
+        if not (st in ("Pending", "Pending Review") or "DISPATCHED" in st):
+            continue
+        d = haversine_m(lat, lng, r["lat"], r["lng"])
+        if d <= best_d:
+            best, best_d = r, d
+    return best
 
 def dispatch_timeout_monitor():
     while True:
-        now = time.time()
-        stale_incidents = list(db.incidents.find({"status": {"$regex": "DISPATCHED"}, "dispatch_time": {"$lt": now - 45}}))
-        for incident in stale_incidents:
-            depts = []
-            if "POLICE" in incident["status"]: depts.append("POLICE BACKUP")
-            if "EMS" in incident["status"]: depts.append("EMS BACKUP")
-            if "CIVIC" in incident["status"]: depts.append("CIVIC BACKUP")
-            dept = " + ".join(depts) if depts else "CENTRAL COMMAND"
-            
-            db.incidents.update_one(
-                {"_id": incident["_id"]}, 
-                {"$set": {"status": f"🚨 RE-ROUTED TO {dept}", "dispatch_time": now}}
-            )
+        try:
+            now = time.time()
+            stale_incidents = (supabase.table("incidents").select("id,status")
+                               .like("status", "%DISPATCHED%")
+                               .lt("dispatch_time", now - 45).execute().data) or []
+            for incident in stale_incidents:
+                depts = []
+                if "POLICE" in incident["status"]: depts.append("POLICE BACKUP")
+                if "EMS" in incident["status"]: depts.append("EMS BACKUP")
+                if "CIVIC" in incident["status"]: depts.append("CIVIC BACKUP")
+                dept = " + ".join(depts) if depts else "CENTRAL COMMAND"
+                supabase.table("incidents").update(
+                    {"status": f"🚨 RE-ROUTED TO {dept}", "dispatch_time": now}
+                ).eq("id", incident["id"]).execute()
+        except Exception as e:
+            # Network hiccups are now possible (remote DB) - never let the monitor thread die.
+            print(f"[MONITOR] Dispatch timeout check failed: {e}")
         time.sleep(10)
 
 threading.Thread(target=dispatch_timeout_monitor, daemon=True).start()
 
 # ----------------- ENDPOINTS -----------------
-@app.post("/api/hardware/telemetry")
-def receive_hardware_telemetry(data: ESP32Telemetry):
+def _store_esp32_state(data: ESP32Telemetry):
+    """Store the latest ESP32 environmental telemetry in the in-memory cache."""
     global hardware_state
     hardware_state.update({
-        "prev_water_level_cm": hardware_state["water_level_cm"], "water_level_cm": data.water_level_cm, 
-        "rain_detected": data.rain_detected, "water_contact": data.water_contact, 
-        "pump_active": data.pump_active, "system_status": data.system_status, "last_update": time.time()
+        "water_raw": data.water_raw,
+        "rain_raw": data.rain_raw,
+        "overall_state": data.overall_state,
+        "last_update": time.time()
     })
+
+
+@app.post("/api/hardware/telemetry")
+def receive_hardware_telemetry(data: ESP32Telemetry):
+    _store_esp32_state(data)
     return {"success": True}
+
+
+@app.post("/api/update-state")
+def update_state(data: ESP32Telemetry):
+    """ESP32-compatible telemetry endpoint used by the current firmware."""
+    _store_esp32_state(data)
+    return {"success": True, "message": "ESP32 state received"}
+
 
 @app.get("/api/hardware/status")
 def get_hardware_status():
@@ -270,15 +348,23 @@ def camera_diagnostics():
     working = [r for r in results if r["frame_read"]]
     return {"working_cameras": working, "all_attempts": results}
 
+def _find_operator(table: str, clean_id: str):
+    pattern = clean_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    rows = supabase.table(table).select("*").ilike("operator_id", pattern).limit(5).execute().data or []
+    for r in rows:
+        if str(r.get("operator_id", "")).lower() == clean_id.lower():
+            return r
+    return None
+
 @app.post("/api/auth/login")
 def unified_login(login_data: OfficialLogin):
     clean_id, clean_key = login_data.operator_id.strip(), login_data.auth_key.strip()
-    admin = db.admins.find_one({"operator_id": {"$regex": f"^{clean_id}$", "$options": "i"}})
+    admin = _find_operator("admins", clean_id)
     if admin and verify_auth_key(clean_key, admin.get("auth_key", "")):
         return {"success": True, "role": "admin"}
-    responder = db.responders.find_one({"operator_id": {"$regex": f"^{clean_id}$", "$options": "i"}})
+    responder = _find_operator("responders", clean_id)
     if responder and verify_auth_key(clean_key, responder.get("auth_key", "")):
-        return {"success": True, "role": "responder", "department": responder.get("department", "POLICE").upper()}
+        return {"success": True, "role": "responder", "department": (responder.get("department") or "POLICE").upper()}
     raise HTTPException(status_code=401, detail="INVALID CREDENTIALS")
 
 @app.get("/api/incidents")
@@ -287,24 +373,25 @@ def get_incidents(limit: int = 200):
     # getting slower over time: every incident ever recorded was being sent
     # and re-sorted on every 4-second poll. The dashboard only ever shows the
     # most recent ones anyway, so cap it server-side.
-    return [format_doc(doc) for doc in list(db.incidents.find().sort("timestamp", -1).limit(max(1, min(limit, 500))))]
+    return supabase.table("incidents").select("*").order("timestamp", desc=True).limit(max(1, min(limit, 500))).execute().data or []
 
 @app.patch("/api/incidents/{incident_id}/status")
 def update_incident_status(incident_id: int, update_data: StatusUpdate):
     update_doc = {"status": update_data.status}
     if update_data.resolution_media: update_doc["resolution_media"] = update_data.resolution_media
-    db.incidents.update_one({"_id": incident_id}, {"$set": update_doc})
+    supabase.table("incidents").update(update_doc).eq("id", incident_id).execute()
     return {"message": "Updated"}
 
 @app.get("/api/reports")
 def get_reports(limit: int = 200):
-    return [format_doc(doc) for doc in list(db.reports.find().sort("timestamp", -1).limit(max(1, min(limit, 500))))]
+    return supabase.table("reports").select("*").order("timestamp", desc=True).limit(max(1, min(limit, 500))).execute().data or []
 
 @app.get("/api/reports/track/{ref_id}")
 def track_report(ref_id: str):
     clean_id = ref_id.replace("JS-", "").strip()
-    for r in list(db.reports.find().sort("_id", -1).limit(2000)):
-        if str(r["_id"]).endswith(clean_id):
+    # Supabase caps a response at 1000 rows by default, so scan the newest 1000.
+    for r in (supabase.table("reports").select("*").order("id", desc=True).limit(1000).execute().data or []):
+        if str(r["id"]).endswith(clean_id):
             return {
                 "success": True, "status": r.get("status", "Unknown"), "concern": r.get("concern_type", "Unknown"), 
                 "date": r.get("timestamp", "Unknown"), "rejection_reason": r.get("rejection_reason"),
@@ -325,8 +412,11 @@ def submit_report(report: CitizenReport):
     if report.lat and report.lng:
         dup = find_nearby_duplicate(report.lat, report.lng, report.concern_type, max_meters=50.0)
         if dup:
-            db.reports.update_one({"_id": dup["_id"]}, {"$inc": {"citizen_upvotes": 1}, "$push": {"supplementary_evidence": report.media_url} if report.media_url else {}})
-            return {"success": True, "ref": f"JS-{str(dup['_id'])[-4:]}", "merged": True, "message": "Incident merged."}
+            patch = {"citizen_upvotes": (dup.get("citizen_upvotes") or 1) + 1}
+            if report.media_url:
+                patch["supplementary_evidence"] = (dup.get("supplementary_evidence") or []) + [report.media_url]
+            supabase.table("reports").update(patch).eq("id", dup["id"]).execute()
+            return {"success": True, "ref": f"JS-{str(dup['id'])[-4:]}", "merged": True, "message": "Incident merged."}
 
     is_valid, decline_reason, ai_conf = True, None, 85.0
 
@@ -343,50 +433,54 @@ def submit_report(report: CitizenReport):
             is_valid, decline_reason = False, "Corrupted image payload."
 
     initial_status = "Pending Review" if is_valid else f"Auto-Declined: {decline_reason}"
-    geojson_loc = {"type": "Point", "coordinates": [report.lng, report.lat]} if report.lng and report.lat else None
 
-    db.reports.insert_one({
-        "_id": new_id, "concern_type": report.concern_type, "severity": report.severity,
-        "landmark": report.landmark, "details": report.details, "lat": report.lat, "lng": report.lng, "loc": geojson_loc,
+    supabase.table("reports").insert({
+        "id": new_id, "concern_type": report.concern_type, "severity": report.severity,
+        "landmark": report.landmark, "details": report.details, "lat": report.lat, "lng": report.lng,
         "media_url": report.media_url, "timestamp": timestamp_str, "status": initial_status,
         "ai_verified": is_valid, "ai_confidence": f"{int(ai_conf)}%", "rejection_reason": decline_reason if not is_valid else None,
         "citizen_upvotes": 1, "supplementary_evidence": []
-    })
+    }).execute()
     return {"success": True, "ref": f"JS-{str(new_id)[-4:]}", "verified": is_valid, "status": initial_status}
 
 @app.patch("/api/reports/{report_id}/status")
 def update_report_status(report_id: int, update_data: StatusUpdate):
     update_doc = {"status": update_data.status}
     if update_data.resolution_media: update_doc["resolution_media"] = update_data.resolution_media
-    db.reports.update_one({"_id": report_id}, {"$set": update_doc})
+    supabase.table("reports").update(update_doc).eq("id", report_id).execute()
     return {"message": "Updated"}
 
 @app.patch("/api/dispatch/{doc_id}")
 def dispatch_official(doc_id: int, data: DispatchUpdate):
-    coll = db.incidents if data.collection == "incidents" else db.reports
-    rep = coll.find_one({"_id": doc_id})
-    if not rep: raise HTTPException(status_code=404, detail="Record not found")
+    table = "incidents" if data.collection == "incidents" else "reports"
+    found = supabase.table(table).select("id").eq("id", doc_id).limit(1).execute().data
+    if not found: raise HTTPException(status_code=404, detail="Record not found")
         
     dept_labels = {"police": "🚓 DISPATCHED (POLICE)", "ems": "🚑 DISPATCHED (EMS)", "civic": "🚜 DISPATCHED (CIVIC)"}
     status_txt = dept_labels.get(data.department.lower(), "🚨 DISPATCHED")
     
-    coll.update_one({"_id": doc_id}, {"$set": {"status": status_txt, "dispatch_time": time.time()}})
+    supabase.table(table).update({"status": status_txt, "dispatch_time": time.time()}).eq("id", doc_id).execute()
     return {"message": "Dispatched", "status": status_txt}
 
 @app.get("/api/stats")
 def get_stats():
-    pending = db.incidents.count_documents({"status": {"$in": ["Pending", "Pending Review"]}}) + db.reports.count_documents({"status": {"$in": ["Pending", "Pending Review"]}})
-    solved = db.incidents.count_documents({"status": {"$nin": ["Pending", "Pending Review"]}}) + db.reports.count_documents({"status": {"$nin": ["Pending", "Pending Review"]}})
+    open_states = ["Pending", "Pending Review"]
+    pending = _count("incidents", open_states) + _count("reports", open_states)
+    solved = _count("incidents", open_states, exclude=True) + _count("reports", open_states, exclude=True)
     return {"pending_reviews": pending, "cases_solved": solved, "active_cctv_nodes": len(CCTV_NODES), "hardware_telemetry": hardware_state}
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Jan Suraksha Core API", "docs": "/docs", "health": "/api/health"}
 
 @app.get("/api/health")
 def health_check():
     """Quick liveness/readiness probe - useful for deployment/monitoring so a
-    failed Mongo connection or a missing model file surfaces immediately
+    failed Supabase connection or a missing model file surfaces immediately
     instead of only showing up as a mysterious 500 later."""
     db_ok = True
     try:
-        client.admin.command("ping")
+        supabase.table("admins").select("id").limit(1).execute()
     except Exception:
         db_ok = False
     return {
@@ -394,6 +488,30 @@ def health_check():
         "database": "connected" if db_ok else "unreachable",
         "pose_model_loaded": ai_pose_model is not None,
     }
+
+# ----------------- EVIDENCE STORAGE (Supabase Storage) -----------------
+# Render's disk is wiped on every deploy/restart, so finished clips are uploaded to a
+# PUBLIC Supabase Storage bucket and the permanent public URL is saved in the incident row.
+# If the upload fails, the incident falls back to the (temporary) local /evidence link.
+EVIDENCE_BUCKET = os.environ.get("EVIDENCE_BUCKET", "evidence")
+EVIDENCE_CONTENT_TYPES = {"webm": "video/webm", "mp4": "video/mp4", "avi": "video/x-msvideo"}
+
+def upload_evidence_to_supabase(local_path, filename):
+    """Upload a clip to Supabase Storage. Returns its public URL, or None on failure."""
+    try:
+        ext = filename.rsplit(".", 1)[-1].lower()
+        with open(local_path, "rb") as fh:
+            data = fh.read()
+        bucket = supabase.storage.from_(EVIDENCE_BUCKET)
+        bucket.upload(
+            path=filename,
+            file=data,
+            file_options={"content-type": EVIDENCE_CONTENT_TYPES.get(ext, "application/octet-stream"), "upsert": "true"},
+        )
+        return str(bucket.get_public_url(filename)).rstrip("?")
+    except Exception as e:
+        print(f"[EVIDENCE] Supabase Storage upload failed for {filename}: {e}")
+        return None
 
 # ----------------- BACKGROUND WEBM VIDEO COMMIT ENGINE -----------------
 def commit_incident_in_memory(event_type, conf_score, captured_frames, snapshots):
@@ -450,22 +568,34 @@ def commit_incident_in_memory(event_type, conf_score, captured_frames, snapshots
                 for frame in captured_frames:
                     out.write(frame)
                 out.release()
-                video_url = f"http://localhost:8000/evidence/{video_filename}"
+                local_path = os.path.join(EVIDENCE_DIR, video_filename)
+                cloud_url = upload_evidence_to_supabase(local_path, video_filename)
+                if cloud_url:
+                    video_url = cloud_url
+                    try:
+                        os.remove(local_path)  # no need to keep a copy on the server
+                    except OSError:
+                        pass
+                else:
+                    video_url = f"{PUBLIC_BASE_URL}/evidence/{video_filename}"
             else:
                 print(f"[EVIDENCE] No working video codec found - incident {incident_id} has snapshots only, no video.")
 
-        db.incidents.insert_one({
-            "_id": incident_id, "event_type": event_type, "risk_score": f"{conf_int}%",
+        supabase.table("incidents").insert({
+            "id": incident_id, "event_type": event_type, "risk_score": f"{conf_int}%",
             "location": "CAM-SMART-ROAD-01 (Sector 3 Model, 208016)", "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "status": assigned_status, "dispatch_time": dispatch_timestamp, "media_url": video_url,
             "snapshots": snapshots, "auto_routed": is_auto
-        })
-        print(f"✅ Successfully committed incident {incident_id} [{event_type}] to MongoDB!")
+        }).execute()
+        print(f"✅ Successfully committed incident {incident_id} [{event_type}] to Supabase!")
+        return {"id": incident_id, "media_url": video_url}
     except Exception as e:
-        print(f"❌ Error committing incident to MongoDB: {e}")
+        print(f"❌ Error committing incident to Supabase: {e}")
+        return None
 
 # ----------------- REAL-TIME AI & TRACKING -----------------
-ai_pose_model = YOLO('yolov8n-pose.pt')
+_pose_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n-pose.pt')
+ai_pose_model = YOLO(_pose_path if os.path.isfile(_pose_path) else 'yolov8n-pose.pt')
 print("[SYSTEM] Running on CPU Mode.")
 
 person_kinematic_cache = {}
@@ -489,6 +619,7 @@ camera_state_lock = threading.Lock()
 latest_encoded_frame = None
 camera_worker_lock = threading.Lock()
 camera_worker_started = False
+last_live_frame_time = 0.0   # updated by the camera loop on every real frame
 
 # --- ALTERCATION / HARASSMENT DETECTION STATE ---
 # Keyed by a stable pair id (frozenset-like tuple of the two track ids), not by
@@ -928,9 +1059,25 @@ def make_status_frame(text_lines):
     ret, buf = cv2.imencode('.jpg', img)
     return buf.tobytes() if ret else b""
 
+# Optional: set VIDEO_SOURCE to a video file path or stream URL (RTSP/HTTP) to run detection without
+# a physical camera - needed on Render, which has no camera. A local file loops forever.
+VIDEO_SOURCE = os.environ.get("VIDEO_SOURCE", "").strip()
+
 def open_camera():
     """Try a range of indices/backends and report exactly what was tried."""
     attempts = []
+    if VIDEO_SOURCE:
+        src = int(VIDEO_SOURCE) if VIDEO_SOURCE.isdigit() else VIDEO_SOURCE
+        cam = cv2.VideoCapture(src)
+        if cam.isOpened():
+            ok, frame = cam.read()
+            if ok and frame is not None:
+                if os.path.isfile(VIDEO_SOURCE):
+                    cam.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                print(f"[CAMERA] Using VIDEO_SOURCE={VIDEO_SOURCE}")
+                return cam
+        cam.release()
+        print(f"[CAMERA] VIDEO_SOURCE={VIDEO_SOURCE} could not be opened, falling back to local cameras.")
     # CAP_DSHOW only exists/works on Windows; on Linux/Mac these attempts fail fast and harmlessly.
     candidates = [
         (0, cv2.CAP_DSHOW, "index 0 (DSHOW)"),
@@ -963,12 +1110,12 @@ def camera_processing_loop():
     """The single owner of the physical camera for the whole process
     lifetime. Runs forever in a background thread; never yields to an HTTP
     client directly (see mjpeg_stream_generator for that)."""
-    global frame_buffer, latest_encoded_frame
+    global frame_buffer, latest_encoded_frame, last_live_frame_time
 
     camera = open_camera()
     while camera is None:
         with camera_state_lock:
-            latest_encoded_frame = make_status_frame(["NO CAMERA DETECTED", "Check USB connection / index", "Retrying every 5s...", "See server console for details"])
+            latest_encoded_frame = make_status_frame(["NO CAMERA DETECTED", "Check USB connection / index", "On a server: set VIDEO_SOURCE env var", "Retrying every 5s..."])
         time.sleep(5.0)
         camera = open_camera()
 
@@ -1004,6 +1151,10 @@ def camera_processing_loop():
     while True:
         success, raw_frame = camera.read()
         if not success or raw_frame is None:
+            if VIDEO_SOURCE and os.path.isfile(VIDEO_SOURCE):
+                camera.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop the demo video
+                time.sleep(0.05)
+                continue
             consecutive_read_failures += 1
             if consecutive_read_failures == 1 or consecutive_read_failures % 50 == 0:
                 print(f"[CAMERA] read() failed ({consecutive_read_failures} consecutive failures) — is the USB camera still connected?")
@@ -1040,6 +1191,7 @@ def camera_processing_loop():
         h, w = frame.shape[:2]
         now = time.time()
         frame_buffer.append(frame.copy())
+        last_live_frame_time = now
         frame_count += 1
 
         if now < abort_msg_until:
@@ -1419,3 +1571,136 @@ def video_feed():
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
     )
+
+
+# ----------------- ESP32 TRIGGER -> CAPTURE -> DETECT -> SIGNAL BACK -----------------
+# Flow:
+#   1. ESP32 POSTs /api/esp32/trigger  (returns immediately with a job_id - never make the
+#      ESP32 wait for video processing, its HTTP client will time out).
+#   2. A background thread records a clip (pre-roll + live), checks it for waterlogging,
+#      uploads the clip and saves an incident if water is confirmed.
+#   3. ESP32 polls GET /api/esp32/job/{job_id} until "done" is true. Polling is used because
+#      the backend on Render cannot open a connection INTO an ESP32 sitting behind a router.
+ESP32_API_KEY = os.environ.get("ESP32_API_KEY", "").strip()               # set this on Render!
+WATERLOG_LEVEL_CM = float(os.environ.get("WATERLOG_LEVEL_CM", "5.0"))     # sensor level counted as waterlogging - tune to your sensor
+CLIP_MIN_SECONDS, CLIP_MAX_SECONDS = 3, 20
+ESP32_JOB_TTL_SECONDS = 3600
+
+esp32_jobs = {}
+esp32_jobs_lock = threading.Lock()
+
+class ESP32Trigger(BaseModel):
+    device_id: str = "esp32-01"
+    event_type: str = "waterlogging"
+    duration_seconds: int = 8
+    water_level_cm: Optional[float] = None
+
+def _check_esp32_key(provided: Optional[str]):
+    if ESP32_API_KEY and provided != ESP32_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Device-Key")
+
+def _job_update(job_id, **fields):
+    with esp32_jobs_lock:
+        if job_id in esp32_jobs:
+            esp32_jobs[job_id].update(fields)
+
+def _prune_old_jobs():
+    cutoff = time.time() - ESP32_JOB_TTL_SECONDS
+    with esp32_jobs_lock:
+        for jid in [j for j, v in esp32_jobs.items() if v["created"] < cutoff]:
+            del esp32_jobs[jid]
+
+def _run_esp32_job(job_id, device_id, event_type, duration, sensor_level):
+    try:
+        start_camera_worker_if_needed()
+        # Give a cold camera a few seconds to produce its first real frame.
+        wait_until = time.time() + 8
+        while time.time() - last_live_frame_time > 5 and time.time() < wait_until:
+            time.sleep(0.25)
+        if time.time() - last_live_frame_time > 5:
+            _job_update(job_id, status="failed", done=True, success=False,
+                        message="Camera offline - no live video source (set VIDEO_SOURCE or connect the camera).")
+            return
+
+        # ---- 1. capture: pre-roll from the rolling buffer + live frames at 10 fps ----
+        _job_update(job_id, status="capturing")
+        frames = list(frame_buffer)
+        t_end = time.time() + duration
+        last_bytes, last_frame = None, None
+        while time.time() < t_end:
+            with camera_state_lock:
+                jpg = latest_encoded_frame
+            if jpg is not None and jpg is not last_bytes:
+                decoded = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                if decoded is not None:
+                    last_bytes, last_frame = jpg, decoded
+            if last_frame is not None:
+                frames.append(last_frame.copy())   # one entry per 0.1s keeps playback at real speed
+            time.sleep(1.0 / FRAME_RATE)
+        if not frames:
+            _job_update(job_id, status="failed", done=True, success=False, message="No frames captured.")
+            return
+
+        # ---- 2. detect waterlogging (camera colour check + optional sensor level) ----
+        _job_update(job_id, status="analyzing")
+        step = max(1, len(frames) // 12)
+        confs, hits = [], 0
+        for f in frames[::step]:
+            ok, _msg, conf = verify_semantic_relevance(f, "waterlogging")
+            confs.append(conf)
+            hits += 1 if ok else 0
+        visual_ok = hits >= max(1, len(confs) // 2)
+        visual_conf = float(np.median(confs)) if confs else 0.0
+
+        if sensor_level is None and time.time() - hardware_state.get("last_update", 0) < 30:
+            sensor_level = hardware_state.get("water_level_cm")     # fall back to latest telemetry
+        sensor_ok = sensor_level is not None and sensor_level >= WATERLOG_LEVEL_CM
+
+        detected = visual_ok or sensor_ok
+        if not detected:
+            _job_update(job_id, status="done", done=True, success=True, detected=False,
+                        confidence=round(visual_conf, 1), water_level_cm=sensor_level,
+                        message="No waterlogging confirmed.")
+            return
+        confidence = min(99, int(visual_conf + (10 if (visual_ok and sensor_ok) else 0))) if visual_ok else 60
+
+        # ---- 3. save clip + incident ----
+        _job_update(job_id, status="saving")
+        snaps = [frame_to_base64_jpeg(frames[len(frames) // 2])]
+        result = commit_incident_in_memory("Water Logging Detected", f"{confidence}%", frames, snaps)
+        if not result:
+            _job_update(job_id, status="failed", done=True, success=False,
+                        message="Waterlogging detected but saving the incident failed - see server logs.")
+            return
+        _job_update(job_id, status="done", done=True, success=True, detected=True, confidence=confidence,
+                    water_level_cm=sensor_level, incident_id=result["id"], media_url=result["media_url"],
+                    message="Waterlogging confirmed. Incident recorded.")
+    except Exception as e:
+        traceback.print_exc()
+        _job_update(job_id, status="failed", done=True, success=False, message=f"Internal error: {e}")
+
+@app.post("/api/esp32/trigger", status_code=202)
+def esp32_trigger(data: ESP32Trigger, x_device_key: Optional[str] = Header(default=None)):
+    _check_esp32_key(x_device_key)
+    _prune_old_jobs()
+    if "water" not in data.event_type.lower() and "flood" not in data.event_type.lower():
+        raise HTTPException(status_code=400, detail="Only waterlogging events are supported by this endpoint.")
+    duration = max(CLIP_MIN_SECONDS, min(CLIP_MAX_SECONDS, data.duration_seconds))
+    with esp32_jobs_lock:
+        for jid, j in esp32_jobs.items():      # ignore sensor bounce: one active job per device
+            if j["device_id"] == data.device_id and not j["done"]:
+                return {"job_id": jid, "status": j["status"], "already_running": True}
+        job_id = f"job_{generate_id()}"
+        esp32_jobs[job_id] = {"job_id": job_id, "device_id": data.device_id, "created": time.time(),
+                              "status": "accepted", "done": False, "success": None, "message": "Trigger received."}
+    threading.Thread(target=_run_esp32_job, args=(job_id, data.device_id, data.event_type, duration, data.water_level_cm), daemon=True).start()
+    return {"job_id": job_id, "status": "accepted", "already_running": False, "poll": f"/api/esp32/job/{job_id}"}
+
+@app.get("/api/esp32/job/{job_id}")
+def esp32_job_status(job_id: str, x_device_key: Optional[str] = Header(default=None)):
+    _check_esp32_key(x_device_key)
+    with esp32_jobs_lock:
+        job = esp32_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Unknown job_id")
+        return {k: v for k, v in job.items() if k != "created"}
