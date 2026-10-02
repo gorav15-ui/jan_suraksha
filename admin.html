@@ -282,7 +282,8 @@
     </main>
 
     <script>
-        const API_BASE = "http://localhost:8000/api";
+        const BACKEND_ORIGIN = "https://jan-suraksha.onrender.com";
+        const API_BASE = BACKEND_ORIGIN + "/api";
         let verifyMapInstance = null;
         let verifyMapMarker = null;
         window.allIncidents = [];
@@ -329,7 +330,7 @@
         }
 
         // ----------------- LIVE CAMERA FEED (with auto-retry) -----------------
-        const VIDEO_FEED_URL = "http://localhost:8000/video_feed";
+        const VIDEO_FEED_URL = BACKEND_ORIGIN + "/video_feed";
         let feedRetryTimer = null;
 
         function connectLiveFeed() {
