@@ -400,7 +400,8 @@
     </footer>
 
     <script>
-        const API_BASE = "http://localhost:8000/api";
+        const BACKEND_ORIGIN = "https://jan-suraksha.onrender.com";
+        const API_BASE = BACKEND_ORIGIN + "/api";
         let map, marker, accuracyCircle;
         const defaultLat = 26.4499, defaultLng = 80.3319;
 
@@ -544,7 +545,7 @@
                         document.getElementById('file-label-text').innerText = 'Tap To Select Photo';
                     }
                 } catch (err) {
-                    alert("Submission failed. Please check connection to local API.");
+                    alert("Submission failed. Could not reach the server. It may be waking up - please wait a few seconds and try again.");
                 } finally {
                     submitBtn.disabled = false;
                     submitBtn.classList.replace('bg-black', 'bg-brand-red');
