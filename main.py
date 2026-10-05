@@ -2,7 +2,7 @@ import os
 import sys
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -487,6 +487,7 @@ def health_check():
         "status": "ok" if db_ok else "degraded",
         "database": "connected" if db_ok else "unreachable",
         "pose_model_loaded": ai_pose_model is not None,
+        "tracker": TRACKER_TYPE,
     }
 
 # ----------------- EVIDENCE STORAGE (Supabase Storage) -----------------
@@ -597,6 +598,61 @@ def commit_incident_in_memory(event_type, conf_score, captured_frames, snapshots
 _pose_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n-pose.pt')
 ai_pose_model = YOLO(_pose_path if os.path.isfile(_pose_path) else 'yolov8n-pose.pt')
 print("[SYSTEM] Running on CPU Mode.")
+
+# ----------------- PERSON TRACKER (ByteTrack / BoT-SORT) -----------------
+# Replaces the hand-rolled IoU/centroid matcher that used to hand out person IDs.
+# Both trackers use a Kalman filter (they PREDICT where each person should be on
+# the next cycle) and Hungarian assignment (globally best matching instead of
+# greedy per-detection), so IDs survive crowding, brief occlusion and fast motion
+# far better - which is exactly what the fall / altercation logic depends on.
+#
+#   TRACKER_TYPE=bytetrack   (default) fastest, best fit for a fixed CCTV camera on CPU
+#   TRACKER_TYPE=botsort     adds camera-motion compensation (use if the pole sways / camera moves)
+#   TRACKER_TYPE=legacy      the old IoU matcher, kept as a safe fallback
+#
+# ByteTrack's main trick: low-confidence boxes (0.10-0.25) are NOT thrown away,
+# they are used only to keep EXISTING tracks alive. A person who has just fallen
+# (lying down, partly occluded) usually scores low - the old conf=0.25 gate
+# dropped them exactly when they mattered most.
+TRACKER_TYPE = os.environ.get("TRACKER_TYPE", "bytetrack").strip().lower()
+TRACK_HIGH_THRESH = 0.25                                                  # boxes >= this can start / continue a track
+DETECT_CONF_FLOOR = float(os.environ.get("DETECT_CONF_FLOOR", "0.10"))    # boxes below this are discarded outright
+TRACK_BUFFER_CYCLES = int(os.environ.get("TRACK_BUFFER_CYCLES", "20"))    # analysis cycles a lost track is remembered (~2-4 s)
+BOTSORT_GMC = os.environ.get("BOTSORT_GMC", "none").strip()               # "none" (static cam) or "sparseOptFlow" (moving cam)
+
+def build_person_tracker(kind=None):
+    """Returns a ByteTrack/BoT-SORT instance, or None -> caller uses the legacy matcher.
+    Never raises: a tracker problem must not take the safety camera offline."""
+    kind = (kind or TRACKER_TYPE).strip().lower()
+    if kind not in ("bytetrack", "botsort"):
+        print("[SYSTEM] Person tracker: legacy IoU matcher.")
+        return None
+    try:
+        from ultralytics.utils import IterableSimpleNamespace
+        cfg = dict(
+            tracker_type=kind,
+            track_high_thresh=TRACK_HIGH_THRESH,
+            track_low_thresh=0.10,
+            new_track_thresh=0.30,
+            track_buffer=TRACK_BUFFER_CYCLES,
+            match_thresh=0.8,
+            fuse_score=True,
+        )
+        # frame_rate=30 makes ultralytics' max_time_lost == track_buffer exactly, i.e. the
+        # buffer is counted in analysis cycles, not wall-clock seconds (our cycle rate varies).
+        if kind == "botsort":
+            from ultralytics.trackers.bot_sort import BOTSORT
+            cfg.update(gmc_method=BOTSORT_GMC, proximity_thresh=0.5, appearance_thresh=0.25,
+                       with_reid=False, model="auto")
+            tracker = BOTSORT(IterableSimpleNamespace(**cfg), frame_rate=30)
+        else:
+            from ultralytics.trackers.byte_tracker import BYTETracker
+            tracker = BYTETracker(IterableSimpleNamespace(**cfg), frame_rate=30)
+        print(f"[SYSTEM] Person tracker: {kind} (buffer={TRACK_BUFFER_CYCLES} cycles, conf floor={DETECT_CONF_FLOOR}).")
+        return tracker
+    except Exception as e:
+        print(f"[SYSTEM] Could not start '{kind}' tracker ({e}) - falling back to the legacy IoU matcher.")
+        return None
 
 person_kinematic_cache = {}
 PRE_ROLL_SECONDS = 5
@@ -1063,8 +1119,67 @@ def make_status_frame(text_lines):
 # a physical camera - needed on Render, which has no camera. A local file loops forever.
 VIDEO_SOURCE = os.environ.get("VIDEO_SOURCE", "").strip()
 
+# ----------------- REMOTE (PUSHED) CAMERA SOURCE -----------------
+# Render has no USB ports. Set VIDEO_SOURCE=push on Render and run push_camera.py on the
+# laptop that has the USB camera: it POSTs JPEG frames to /api/camera/push, and the normal
+# detection loop below reads them exactly like a local camera.
+# Also set CAMERA_PUSH_KEY on Render (any long random string) - pushes are refused without it.
+CAMERA_PUSH_KEY = os.environ.get("CAMERA_PUSH_KEY", "").strip()
+_pushed_frame = None
+_pushed_frame_seq = 0
+_pushed_frame_time = 0.0
+_pushed_lock = threading.Lock()
+
+class PushedFrameCamera:
+    """Minimal cv2.VideoCapture look-alike that serves frames pushed over HTTP."""
+    def __init__(self):
+        self._last_seq = 0
+    def isOpened(self):
+        return True
+    def set(self, *args, **kwargs):
+        return True
+    def release(self):
+        pass
+    def read(self):
+        deadline = time.time() + 0.2
+        while time.time() < deadline:
+            with _pushed_lock:
+                fresh = _pushed_frame is not None and (time.time() - _pushed_frame_time) < 5.0
+                if fresh and _pushed_frame_seq != self._last_seq:
+                    self._last_seq = _pushed_frame_seq
+                    return True, _pushed_frame.copy()
+            time.sleep(0.01)
+        return False, None
+
+@app.post("/api/camera/push")
+async def push_camera_frame(request: Request, x_camera_key: Optional[str] = Header(default=None)):
+    global _pushed_frame, _pushed_frame_seq, _pushed_frame_time
+    if VIDEO_SOURCE.lower() != "push":
+        raise HTTPException(status_code=409, detail="Backend is not in push mode (set VIDEO_SOURCE=push).")
+    if not CAMERA_PUSH_KEY:
+        raise HTTPException(status_code=503, detail="CAMERA_PUSH_KEY is not set on the server.")
+    if x_camera_key != CAMERA_PUSH_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Camera-Key")
+    body = await request.body()
+    if not body or len(body) > 2_000_000:
+        raise HTTPException(status_code=400, detail="Empty or oversized frame")
+    frame = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Body is not a valid JPEG")
+    with _pushed_lock:
+        _pushed_frame = frame
+        _pushed_frame_seq += 1
+        _pushed_frame_time = time.time()
+    return {"ok": True}
+
 def open_camera():
     """Try a range of indices/backends and report exactly what was tried."""
+    global latest_encoded_frame
+    if VIDEO_SOURCE.lower() == "push":
+        print("[CAMERA] PUSH mode: waiting for frames from push_camera.py on /api/camera/push")
+        with camera_state_lock:
+            latest_encoded_frame = make_status_frame(["WAITING FOR CAMERA", "Run push_camera.py on the laptop", "with the USB camera attached"])
+        return PushedFrameCamera()
     attempts = []
     if VIDEO_SOURCE:
         src = int(VIDEO_SOURCE) if VIDEO_SOURCE.isdigit() else VIDEO_SOURCE
@@ -1138,6 +1253,8 @@ def camera_processing_loop():
     cached_fall, cached_water = None, None
     cached_altercation = None
     prev_gray_for_motion = None
+    person_tracker = build_person_tracker()   # None -> legacy matcher
+    tracker_dirty = False                     # True once the tracker holds state worth clearing
     MOTION_SKIP_THRESHOLD = 2.0   # mean pixel diff (0-255) below which we call the scene static
 
     is_alt_recording, alt_recording_start = False, 0
@@ -1210,12 +1327,22 @@ def camera_processing_loop():
             scene_is_idle = motion_score < MOTION_SKIP_THRESHOLD
         prev_gray_for_motion = gray_now
 
+        # Nobody tracked and nothing moving: drop the tracker's memory too. Its Kalman
+        # predictions only advance per update, so a stale "lost" track from hours ago
+        # could otherwise be revived (and its ID reused) by the next person who walks in.
+        # Person cache is already empty here, so restarting IDs from 1 can't collide;
+        # pair state is cleared for the same reason.
+        if scene_is_idle and person_tracker is not None and tracker_dirty:
+            person_tracker.reset()
+            altercation_cache.clear()
+            tracker_dirty = False
+
         if frame_count % 3 == 0 and not scene_is_idle:
             try:
                 cached_humans.clear(); cached_kpts.clear(); cached_kconfs.clear()
                 cached_fall = None; cached_water = None; cached_altercation = None
 
-                results = ai_pose_model(frame, conf=0.25, imgsz=320, device='cpu', verbose=False) 
+                results = ai_pose_model(frame, conf=(DETECT_CONF_FLOOR if person_tracker is not None else 0.25), imgsz=320, device='cpu', verbose=False) 
                 detected_pids = set()
                 active_people = []
                 pid_to_pose = {}
@@ -1233,12 +1360,36 @@ def camera_processing_loop():
                     has_kconf = has_kpts and r.keypoints.conf is not None
                     kpts_conf = r.keypoints.conf.cpu().numpy() if has_kconf else None
 
+                    # --- ByteTrack / BoT-SORT: one update per analysis cycle (always, even with
+                    # zero detections, so lost tracks age out). Output rows are
+                    # [x1, y1, x2, y2, track_id, score, cls, det_idx]; det_idx lets us keep using the
+                    # RAW detection box + keypoints below (so every fall/fight threshold that was
+                    # tuned on raw boxes stays valid) and take only the stable ID from the tracker.
+                    det_to_track = None
+                    det_confs = r.boxes.conf.cpu().numpy()
+                    if person_tracker is not None:
+                        try:
+                            tracks = person_tracker.update(r.boxes.cpu().numpy(), frame)
+                            tracker_dirty = True
+                            if len(tracks) and tracks.shape[1] < 8:
+                                raise RuntimeError("installed ultralytics does not return detection indices - upgrade ultralytics")
+                            det_to_track = {int(t[-1]): int(t[4]) for t in tracks}
+                        except Exception:
+                            print("[TRACKER] Tracker failed - switching to legacy IoU matcher for the rest of this run:")
+                            traceback.print_exc()
+                            person_tracker = None
+                            det_to_track = None
+
                     for i, box in enumerate(boxes):
                         x1, y1, x2, y2 = map(int, box[:4])
                         box_width = max(1, x2 - x1)
                         box_height = max(1, y2 - y1)
                     
-                        if box_width < 40 and box_height < 40: continue 
+                        if box_width < 40 and box_height < 40: continue
+                        # Low-confidence boxes (below the old 0.25 gate) are only useful when they
+                        # extend an existing track. Anything else is ignored, same as before.
+                        if det_to_track is not None and i not in det_to_track and float(det_confs[i]) < TRACK_HIGH_THRESH:
+                            continue 
 
                         this_kpts = kpts_xy[i] if kpts_xy is not None else np.zeros((17, 2))
                         this_kconf = kpts_conf[i] if kpts_conf is not None else np.full(17, -1.0)
@@ -1250,28 +1401,43 @@ def camera_processing_loop():
                         cx = (x1 + x2) / 2.0
                         cy = (y1 + y2) / 2.0
 
-                        best_id = None
-                        best_score = -1.0
-                        for pid, data in person_kinematic_cache.items():
-                            if len(data["history"]) == 0: continue
-                            last_cx, last_cy, last_w, last_h = data["history"][-1][1], data["history"][-1][2], data["history"][-1][3], data["history"][-1][4]
-                            iou = _iou_from_center(cx, cy, box_width, box_height, last_cx, last_cy, last_w, last_h)
-                            dist = math.hypot(cx - last_cx, cy - last_cy)
-                            # IoU survives close/overlapping people (exactly the case in a fight
-                            # or a crowd) far better than raw centroid distance, which is prone
-                            # to swapping IDs between two nearby people. Fall back to distance
-                            # only when the boxes don't overlap at all (e.g. fast motion).
-                            score = iou if iou > 0 else -dist / 300.0
-                            if score > best_score and (iou > 0.1 or dist < 200.0):
-                                best_score = score
-                                best_id = pid
+                        if det_to_track is not None:
+                            tid = det_to_track.get(i)
+                            if tid is None:
+                                # Real detection, but the tracker hasn't confirmed it as a person yet
+                                # (a NEW track needs a second sighting before it is output). Costs one
+                                # analysis cycle for a newcomer, and filters one-frame ghost boxes.
+                                continue
+                            best_id = f"t{tid}"
+                            if best_id not in person_kinematic_cache:
+                                person_kinematic_cache[best_id] = {
+                                    "history": deque(maxlen=20),
+                                    "stationary_time": 0.0
+                                }
+                        else:
+                            # ---- legacy IoU / centroid matcher (fallback) ----
+                            best_id = None
+                            best_score = -1.0
+                            for pid, data in person_kinematic_cache.items():
+                                if len(data["history"]) == 0: continue
+                                last_cx, last_cy, last_w, last_h = data["history"][-1][1], data["history"][-1][2], data["history"][-1][3], data["history"][-1][4]
+                                iou = _iou_from_center(cx, cy, box_width, box_height, last_cx, last_cy, last_w, last_h)
+                                dist = math.hypot(cx - last_cx, cy - last_cy)
+                                # IoU survives close/overlapping people (exactly the case in a fight
+                                # or a crowd) far better than raw centroid distance, which is prone
+                                # to swapping IDs between two nearby people. Fall back to distance
+                                # only when the boxes don't overlap at all (e.g. fast motion).
+                                score = iou if iou > 0 else -dist / 300.0
+                                if score > best_score and (iou > 0.1 or dist < 200.0):
+                                    best_score = score
+                                    best_id = pid
                             
-                        if best_id is None:
-                            best_id = f"p_{int(now*1000) % 100000}"
-                            person_kinematic_cache[best_id] = {
-                                "history": deque(maxlen=20), 
-                                "stationary_time": 0.0
-                            }
+                            if best_id is None:
+                                best_id = f"p_{int(now*1000) % 100000}"
+                                person_kinematic_cache[best_id] = {
+                                    "history": deque(maxlen=20), 
+                                    "stationary_time": 0.0
+                                }
                     
                         track_id = best_id
                         detected_pids.add(track_id)
