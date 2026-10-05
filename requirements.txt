@@ -1,9 +1,12 @@
+
 fastapi
 uvicorn[standard]
 pydantic
 supabase
-python-dotenv
 opencv-python-headless
 numpy
 pillow
 ultralytics
+torch
+torchvision
+lapx
