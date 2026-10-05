@@ -54,6 +54,7 @@
                         <p><span class="text-gray-500">Concern:</span> <span id="v-concern" class="text-black"></span></p>
                         <p><span class="text-gray-500">AI Confidence:</span> <span id="v-severity" class="text-brand-red font-black text-lg"></span></p>
                         <p><span class="text-gray-500">Address:</span> <span id="v-address" class="text-black"></span></p>
+                        <p><span class="text-gray-500">Reported:</span> <span id="v-time" class="text-black"></span></p>
                         <p><span class="text-gray-500">Details:</span> <span id="v-details" class="text-black whitespace-pre-wrap"></span></p>
                     </div>
                     
@@ -224,6 +225,7 @@
                             <th class="p-3 border-2 border-black">Type</th>
                             <th class="p-3 border-2 border-black">AI Confidence</th>
                             <th class="p-3 border-2 border-black">Location</th>
+                            <th class="p-3 border-2 border-black">Time</th>
                             <th class="p-3 border-2 border-black">Status</th>
                             <th class="p-3 border-2 border-black">Action</th>
                         </tr>
@@ -249,6 +251,7 @@
                             <th class="p-3 border-2 border-black">Concern</th>
                             <th class="p-3 border-2 border-black">Severity</th>
                             <th class="p-3 border-2 border-black">Location</th>
+                            <th class="p-3 border-2 border-black">Time</th>
                             <th class="p-3 border-2 border-black">Status</th>
                             <th class="p-3 border-2 border-black">Action</th>
                         </tr>
@@ -271,6 +274,7 @@
                             <th class="p-3 border-2 border-black">Concern Type</th>
                             <th class="p-3 border-2 border-black">AI Confidence / Risk</th>
                             <th class="p-3 border-2 border-black">Location</th>
+                            <th class="p-3 border-2 border-black">Time</th>
                             <th class="p-3 border-2 border-black">Final Status</th>
                             <th class="p-3 border-2 border-black">Action</th>
                         </tr>
@@ -471,6 +475,16 @@
             renderAllData();
         }
 
+        function formatTs(ts) {
+            if (!ts) return '—';
+            let s = String(ts).trim();
+            // Backend saves "YYYY-MM-DD HH:MM:SS" in server time (UTC on Render); show it in the viewer's local time.
+            if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(s)) s = s.replace(' ', 'T') + 'Z';
+            const d = new Date(s);
+            if (isNaN(d)) return String(ts);
+            return d.toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true });
+        }
+        
         function renderAllData() {
             const activeIncidentsBody = document.getElementById('incidents-table-body'); 
             const activeReportsBody = document.getElementById('reports-table-body');
@@ -519,10 +533,10 @@
                     tr.className = "border-b-2 border-black font-bold text-sm hover:bg-gray-100 transition-colors";
                     
                     if (!isReport) {
-                        tr.innerHTML = `<td class="p-3 border-2 border-black">${badge}</td><td class="p-3 border-2 border-black text-brand-red font-black whitespace-nowrap">${score}</td><td class="p-3 border-2 border-black min-w-[200px]">${loc}</td><td class="p-3 border-2 border-black">${statusHtml}</td><td class="p-3 border-2 border-black">${actionBtn}</td>`;
+                        tr.innerHTML = `<td class="p-3 border-2 border-black">${badge}</td><td class="p-3 border-2 border-black text-brand-red font-black whitespace-nowrap">${score}</td><td class="p-3 border-2 border-black min-w-[200px]">${loc}</td><td class="p-3 border-2 border-black whitespace-nowrap text-xs">${formatTs(item.timestamp)}</td><td class="p-3 border-2 border-black">${statusHtml}</td><td class="p-3 border-2 border-black">${actionBtn}</td>`;
                         if (activeIncidentsBody) activeIncidentsBody.appendChild(tr);
                     } else {
-                        tr.innerHTML = `<td class="p-3 border-2 border-black">${badge}</td><td class="p-3 border-2 border-black text-brand-red font-black whitespace-nowrap">${item.severity}</td><td class="p-3 border-2 border-black min-w-[200px]">${loc}</td><td class="p-3 border-2 border-black">${statusHtml}</td><td class="p-3 border-2 border-black">${actionBtn}</td>`;
+                        tr.innerHTML = `<td class="p-3 border-2 border-black">${badge}</td><td class="p-3 border-2 border-black text-brand-red font-black whitespace-nowrap">${item.severity}</td><td class="p-3 border-2 border-black min-w-[200px]">${loc}</td><td class="p-3 border-2 border-black whitespace-nowrap text-xs">${formatTs(item.timestamp)}</td><td class="p-3 border-2 border-black">${statusHtml}</td><td class="p-3 border-2 border-black">${actionBtn}</td>`;
                         if (activeReportsBody) activeReportsBody.appendChild(tr);
                     }
                 } else {
@@ -531,7 +545,7 @@
 
                     const tr = document.createElement('tr'); 
                     tr.className = "border-b-2 border-black font-bold text-sm hover:bg-gray-100 transition-colors opacity-80";
-                    tr.innerHTML = `<td class="p-3 border-2 border-black">${badge}</td><td class="p-3 border-2 border-black font-black whitespace-nowrap">${score}</td><td class="p-3 border-2 border-black min-w-[200px]">${loc}</td><td class="p-3 border-2 border-black">${statusHtml}</td><td class="p-3 border-2 border-black"><button onclick="openVerifyModal('${item.id}', '${collectionStr}')" class="bg-gray-800 text-white px-4 py-2 border-2 border-black text-xs font-black hover:bg-brand-yellow hover:text-black uppercase flex items-center justify-center gap-1 w-full"><span class="material-symbols-outlined text-[14px]">folder_open</span> DOSSIER</button></td>`;
+                    tr.innerHTML = `<td class="p-3 border-2 border-black">${badge}</td><td class="p-3 border-2 border-black font-black whitespace-nowrap">${score}</td><td class="p-3 border-2 border-black min-w-[200px]">${loc}</td><td class="p-3 border-2 border-black whitespace-nowrap text-xs">${formatTs(item.timestamp)}</td><td class="p-3 border-2 border-black">${statusHtml}</td><td class="p-3 border-2 border-black"><button onclick="openVerifyModal('${item.id}', '${collectionStr}')" class="bg-gray-800 text-white px-4 py-2 border-2 border-black text-xs font-black hover:bg-brand-yellow hover:text-black uppercase flex items-center justify-center gap-1 w-full"><span class="material-symbols-outlined text-[14px]">folder_open</span> DOSSIER</button></td>`;
                                    
                     if (resolvedBody) resolvedBody.appendChild(tr);
                 }
@@ -554,6 +568,7 @@
             document.getElementById('v-concern').innerHTML = getCategoryBadge(report.concern_type || report.event_type);
             document.getElementById('v-severity').innerText = report.severity || (report.risk_score + " Confidence");
             document.getElementById('v-address').innerText = report.landmark || report.location;
+            document.getElementById('v-time').innerText = formatTs(report.timestamp);
             document.getElementById('v-details').innerText = report.details || "AI Automated Event Log. Review attached evidence.";
 
             const mediaContainer = document.getElementById('v-media-container'); 
