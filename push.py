@@ -18,7 +18,7 @@ import cv2
 import requests
 
 SERVER = os.environ.get("SERVER", "https://jan-suraksha.onrender.com").rstrip("/")
-KEY = os.environ.get("CAMERA_PUSH_KEY", "PUT_YOUR_SECRET_KEY_HERE")
+KEY = os.environ.get("push", "Jzz3BAlCqPEK9tTqzyfbFJxLNop21lX76lkL2DqDdSM")
 CAM_INDEX = int(os.environ.get("CAM_INDEX", "0"))
 FPS = float(os.environ.get("FPS", "8"))
 JPEG_QUALITY = 60
