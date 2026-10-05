@@ -1,11 +1,19 @@
+# NOTE: torch and torchvision are intentionally NOT listed here.
+# They are installed first, from the CPU-only index, by the Render build command:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt
+# This keeps the multi-GB NVIDIA/CUDA packages (nvidia-*, triton) out of the build.
+
+# Web server
 fastapi
 uvicorn[standard]
 pydantic
+
+# Database
 supabase
+
+# Computer vision / AI (ultralytics reuses the CPU torch installed above)
 opencv-python-headless
 numpy
 pillow
 ultralytics
-torch
-torchvision
 lapx
